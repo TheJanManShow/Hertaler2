@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hertaler2 — Re-translate with PPQ</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="container">
+    <h1>Hertaler2</h1>
+    <p class="muted">Drop a TXT / MD / HTML / EPUB file, choose a reading level, optionally top-up via PPQ Lightning (100 SATS min), then click Hertaal to re-translate while preserving meaning and style.</p>
+
+    <section class="card">
+      <label>Paste your PPQ API key for this session</label>
+      <input id="apiKey" placeholder="sk-..." />
+      <div class="row">
+        <button id="checkBalance">Check balance</button>
+        <div id="balance" class="muted">Balance: —</div>
+      </div>
+      <div id="balanceMsg" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <label>Upload file (TXT / MD / HTML / EPUB)</label>
+      <div id="dropzone" class="dropzone">Drop file here or <input id="fileInput" type="file" /></div>
+      <div id="fileInfo" class="muted small">No file selected</div>
+    </section>
+
+    <section class="card">
+      <label>Reading level</label>
+      <div class="slider">
+        <input type="range" id="level" min="0" max="2" step="1" value="2" />
+        <div class="levels"><span>Child</span><span>Teen</span><span>Adult</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <label>Donate to top up PPQ (required choice before Hertaal)</label>
+      <div class="row">
+        <label><input type="radio" name="donate" value="no" /> No, don't donate</label>
+        <label><input type="radio" name="donate" value="yes" /> Yes, create Lightning invoice (100 sats min)</label>
+      </div>
+      <div id="donationArea" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <label>Concurrency (parallel chapter translations)</label>
+      <input type="number" id="concurrency" min="1" max="8" value="4" />
+      <div class="muted small">Default 4. Parallel requests speed up work but consume separate credits per request.</div>
+    </section>
+
+    <section class="card">
+      <button id="createInvoiceBtn" disabled>Create top-up invoice</button>
+      <div id="invoiceArea" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <button id="hertaal" disabled>Hertaal (Re-translate)</button>
+      <div id="log" class="log"></div>
+    </section>
+
+    <footer class="muted small">Vibed with Shakespeare — <a href="https://shakespeare.diy" target="_blank">shakespeare.diy</a></footer>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script>
+  // Helper utilities
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('log');
+  function log(msg) { const p = document.createElement('div'); p.textContent = msg; logEl.prepend(p); }
+
+  let selectedFile = null;
+  let epubFiles = null; // JSZip instance for EPUB
+  let invoiceId = null;
+  let invoicePaid = false;
+
+  // Drag & drop
+  const drop = $('dropzone');
+  const fileInput = $('fileInput');
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('hover'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('hover'));
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('hover'); const f = e.dataTransfer.files[0]; handleFile(f); });
+  fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+
+  function handleFile(file) {
+    if (!file) return;
+    selectedFile = file;
+    $('fileInfo').textContent = `${file.name} — ${Math.round(file.size/1024)} KB`;
+    log(`Selected file: ${file.name}`);
+  }
+
+  // Balance check
+  $('checkBalance').addEventListener('click', async () => {
+    const key = $('apiKey').value.trim();
+    if (!key) { alert('Paste your PPQ API key first'); return; }
+    $('balance').textContent = 'Balance: checking...';
+    try {
+      // Try GET /keys as a probe
+      const res = await fetch('https://api.ppq.ai/keys', { headers: { 'Authorization': 'Bearer '+key } });
+      if (res.ok) {
+        const j = await res.json();
+        $('balance').textContent = 'Balance: (keys returned)';
+        $('balanceMsg').textContent = JSON.stringify(j.data?.slice(0,3) ?? j, null, 2);
+        log('Fetched keys info');
+        return;
+      }
+      // Fallback to credits/balance without credit_id (best-effort)
+      const res2 = await fetch('https://api.ppq.ai/credits/balance', { method: 'POST', headers: { 'Content-Type':'application/json', 'Authorization':'Bearer '+key }, body: '{}' });
+      if (res2.ok) {
+        const j2 = await res2.json();
+        $('balance').textContent = 'Balance: ' + (j2?.balance ?? JSON.stringify(j2));
+        $('balanceMsg').textContent = '';
+        log('Fetched credits.balance');
+        return;
+      }
+      $('balance').textContent = 'Balance: unavailable';
+      $('balanceMsg').textContent = 'Could not read balance via API; you can view your account at https://ppq.ai';
+      log('Balance fetch failed: ' + res.status);
+    } catch (err) {
+      console.error(err);
+      $('balance').textContent = 'Balance: error';
+      $('balanceMsg').textContent = 'Error fetching balance: ' + err.message;
+    }
+  });
+
+  // Donation radio buttons
+  document.querySelectorAll('input[name="donate"]').forEach(r => r.addEventListener('change', (e) => {
+    const v = e.target.value;
+    $('createInvoiceBtn').disabled = v !== 'yes';
+    // Hertaal enabled only if user explicitly chose no or has paid invoice
+    updateHertaalState();
+  }));
+
+  function updateHertaalState() {
+    const choice = document.querySelector('input[name="donate"]:checked');
+    if (!choice) { $('hertaal').disabled = true; return; }
+    if (choice.value === 'no') { $('hertaal').disabled = !selectedFile; return; }
+    // donate chosen
+    $('hertaal').disabled = !(invoicePaid && selectedFile);
+  }
+
+  // Create invoice
+  $('createInvoiceBtn').addEventListener('click', async () => {
+    const key = $('apiKey').value.trim();
+    if (!key) { alert('Paste your PPQ API key first'); return; }
+    const amt = 100; // minimum as per PPQ docs
+    $('invoiceArea').textContent = 'Creating invoice...';
+    try {
+      const res = await fetch('https://api.ppq.ai/topup/create/btc-lightning', {
+        method: 'POST', headers: { 'Authorization': 'Bearer '+key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: amt, currency: 'SATS' })
+      });
+      if (!res.ok) { const t = await res.text(); $('invoiceArea').textContent = 'Invoice creation failed: '+res.status+' '+t; return; }
+      const j = await res.json();
+      // PPQ returns invoice info — try to find id and invoice/bbolt11
+      invoiceId = j?.id || j?.invoice_id || j?.invoice?.id || j?.paymentRequest || j?.bolt11 || j?.invoice;
+      const bolt11 = j?.payment_request || j?.invoice || j?.bolt11 || j?.paymentRequest || j?.payment_request;
+      $('invoiceArea').innerHTML = '';
+      if (bolt11) {
+        const pre = document.createElement('pre'); pre.textContent = 'BOLT11: '+bolt11; $('invoiceArea').appendChild(pre);
+        const qrcode = document.createElement('div'); $('invoiceArea').appendChild(qrcode);
+        try { new QRCode(qrcode, { text: bolt11, width: 180, height: 180 }); } catch(e) {}
+      }
+      if (j?.id) {
+        $('invoiceArea').appendChild(document.createTextNode('Invoice id: '+j.id));
+        invoiceId = j.id;
+      }
+      $('invoiceArea').appendChild(document.createElement('br'));
+      const payBtn = document.createElement('button'); payBtn.textContent = 'I paid (poll status)';
+      payBtn.addEventListener('click', () => pollInvoiceStatus(key, invoiceId));
+      $('invoiceArea').appendChild(payBtn);
+      log('Invoice created');
+    } catch (err) {
+      console.error(err);
+      $('invoiceArea').textContent = 'Error creating invoice: '+err.message;
+    }
+  });
+
+  async function pollInvoiceStatus(key, id) {
+    if (!id) { $('invoiceArea').textContent = 'No invoice id to poll.'; return; }
+    $('invoiceArea').textContent = 'Polling invoice status...';
+    try {
+      const res = await fetch(`https://api.ppq.ai/topup/status/${encodeURIComponent(id)}`, { headers: { 'Authorization': 'Bearer '+key } });
+      if (!res.ok) { const t = await res.text(); $('invoiceArea').textContent = 'Status check failed: '+res.status+' '+t; return; }
+      const j = await res.json();
+      $('invoiceArea').textContent = 'Status: '+JSON.stringify(j);
+      if (j?.status === 'paid' || j?.paid === true) {
+        invoicePaid = true; $('invoiceArea').textContent = 'Paid ✓'; updateHertaalState(); log('Invoice paid'); return; }
+      // Not paid — schedule another poll in 5s
+      setTimeout(() => pollInvoiceStatus(key, id), 5000);
+    } catch (err) { $('invoiceArea').textContent = 'Error polling status: '+err.message; }
+  }
+
+  // Hertaal action
+  $('hertaal').addEventListener('click', async () => {
+    if (!selectedFile) { alert('Choose a file first'); return; }
+    const key = $('apiKey').value.trim();
+    if (!key) { alert('Paste your PPQ API key first'); return; }
+    $('hertaal').disabled = true;
+    log('Starting re-translation...');
+    const level = parseInt($('level').value,10);
+    const levelName = ['Child','Teen','Adult'][level];
+    const concurrency = Math.max(1, parseInt($('concurrency').value,10) || 4);
+
+    try {
+      const name = selectedFile.name;
+      if (name.endsWith('.txt') || name.endsWith('.md') || name.endsWith('.html') || name.endsWith('.htm')) {
+        const text = await selectedFile.text();
+        const translated = await translateChunkHtmlOrText(text, levelName, key);
+        downloadBlob(new Blob([translated], {type:'text/plain'}), name.replace(/\.(txt|md|html|htm)$/i, `_hertaal.${name.split('.').pop()}`));
+        log('Done: downloaded translated file');
+      } else if (name.endsWith('.epub')) {
+        // parse EPUB via JSZip
+        const arrayBuffer = await selectedFile.arrayBuffer();
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        epubFiles = zip;
+        // find content.opf by reading META-INF/container.xml
+        const containerXml = await zip.file('META-INF/container.xml').async('text');
+        const parser = new DOMParser();
+        const contDoc = parser.parseFromString(containerXml, 'application/xml');
+        const rootfile = contDoc.querySelector('rootfile');
+        const opfPath = rootfile ? rootfile.getAttribute('full-path') : 'content.opf';
+        log('OPF at '+opfPath);
+        const opfText = await zip.file(opfPath).async('text');
+        const opfDoc = parser.parseFromString(opfText, 'application/xml');
+        // build map of id->href
+        const manifestItems = {}; for (const item of opfDoc.getElementsByTagName('item')) manifestItems[item.getAttribute('id')] = item.getAttribute('href');
+        const spine = [...opfDoc.getElementsByTagName('itemref')].map(ir => ir.getAttribute('idref'));
+        log('Found '+spine.length+' spine items');
+        // Prepare tasks for each spine item
+        const tasks = spine.map(idref => ({ idref, href: manifestItems[idref] }));
+        // translate each in parallel limited
+        const pool = makePool(concurrency);
+        for (const t of tasks) pool.add(async () => {
+          const itemPath = resolvePath(opfPath, t.href);
+          const file = zip.file(itemPath);
+          if (!file) { log('Missing spine file '+itemPath); return; }
+          const html = await file.async('text');
+          // extract body innerHTML
+          const doc = parser.parseFromString(html, 'text/html');
+          const body = doc.body.innerHTML;
+          const translated = await translateChunkHtmlOrText(body, levelName, key);
+          // put translated back into doc
+          const outDoc = parser.parseFromString(html, 'text/html');
+          outDoc.body.innerHTML = translated;
+          const serializer = new XMLSerializer();
+          const outText = '<!DOCTYPE html>\n' + serializer.serializeToString(outDoc);
+          zip.file(itemPath, outText);
+          log('Translated '+t.href);
+        });
+        await pool.runAll();
+        log('All chapters translated. Repacking EPUB...');
+        // ensure mimetype file stored uncompressed at root
+        // JSZip options: { compression: 'STORE' } ??? JSZip uses options.compress
+        // We'll generate blob and download as .epub
+        const content = await zip.generateAsync({type:'blob'});
+        downloadBlob(content, name.replace(/\.epub$/i, '_hertaal.epub'));
+        log('EPUB download ready');
+      } else {
+        alert('Unsupported file type. Use TXT/MD/HTML/EPUB');
+      }
+    } catch (err) {
+      console.error(err); log('Error: '+err.message); alert('Error: '+err.message);
+    } finally {
+      $('hertaal').disabled = false; updateHertaalState();
+    }
+  });
+
+  // Utilities: resolve relative path (opf base)
+  function resolvePath(basePath, href) {
+    const base = basePath.split('/').slice(0,-1).join('/');
+    return (base? base+'/' : '') + href;
+  }
+
+  // Simple concurrency pool
+  function makePool(limit) {
+    const queue = []; let active = 0;
+    return {
+      add: (fn) => queue.push(fn),
+      runAll: async () => new Promise((resolve, reject) => {
+        const next = () => {
+          if (!queue.length && active===0) return resolve();
+          while (active < limit && queue.length) {
+            const fn = queue.shift(); active++; fn().then(()=>{ active--; next(); }).catch(e=>{ reject(e); });
+          }
+        }; next();
+      })
+    };
+  }
+
+  // Translate chunk using PPQ Chat API
+  async function translateChunkHtmlOrText(inputHtmlOrText, levelName, key) {
+    const system = `You are a careful translator. Re-translate the provided content to be appropriate for the target audience level without changing meaning, tone, cadence or the author's original style. Preserve HTML tags and inline markup. Only modify textual nodes, keep tags intact. Respond with the HTML/body content only.`;
+    const user = `Level: ${levelName}\nContent:\n${inputHtmlOrText}`;
+    const payload = { model: 'openai/gpt-5.5', messages: [ { role: 'system', content: system }, { role:'user', content: user } ] };
+    const res = await fetch('https://api.ppq.ai/chat/completions', { method: 'POST', headers: { 'Content-Type':'application/json', 'Authorization':'Bearer '+key }, body: JSON.stringify(payload) });
+    if (!res.ok) {
+      const t = await res.text(); throw new Error('PPQ translate failed: '+res.status+' '+t);
+    }
+    const j = await res.json();
+    // Try to extract assistant text
+    let out = '';
+    if (j.choices && j.choices[0]?.message?.content) out = j.choices[0].message.content;
+    else if (j.output_text) out = j.output_text;
+    else out = JSON.stringify(j);
+    return out;
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  }
+
+  // simple QR lib (only if available) fallback
+  // load QRCode if not present
+  (function loadQRCode(){
+    if (window.QRCode) return;
+    const s = document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/qrcodejs2@0.0.2/qrcode.min.js'; s.onload = ()=>log('QR lib loaded'); document.head.appendChild(s);
+  })();
+
+  // enable Hertaal when file selected and choices made
+  setInterval(updateHertaalState, 500);
+
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif;margin:0;padding:24px;background:#f7f9fb;color:#0f172a}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:28px;margin-bottom:8px}
+.muted{color:#475569}
+.card{background:white;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 4px 14px rgba(2,6,23,0.06)}
+.dropzone{border:2px dashed #e6eef8;padding:18px;border-radius:8px;text-align:center}
+.dropzone.hover{background:#eef6ff}
+.small{font-size:13px}
+.row{display:flex;gap:12px;align-items:center}
+.slider input[type=range]{width:100%}
+.levels{display:flex;justify-content:space-between;font-size:13px;margin-top:8px}
+.log{background:#0b1220;color:#e6f2ff;padding:8px;border-radius:8px;margin-top:8px;min-height:40px}
+button{background:#0369a1;color:white;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+button[disabled]{opacity:0.5;cursor:not-allowed}
