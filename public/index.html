@@ -166,7 +166,54 @@
       if (bolt11) {
         const pre = document.createElement('pre'); pre.textContent = 'BOLT11: '+bolt11; $('invoiceArea').appendChild(pre);
         const qrcode = document.createElement('div'); qrcode.id = 'qrContainer'; qrcode.style.marginTop = '8px'; $('invoiceArea').appendChild(qrcode);
-        try { await renderQr(qrcode, bolt11); } catch(e) { console.warn('QR render failed', e); }
+        try {
+          await renderQr(qrcode, bolt11);
+        } catch(e) {
+          console.warn('QR render failed', e);
+        }
+        // Collect possible LN invoice strings and explicit logging
+        const lnCandidates = [
+          bolt11,
+          j?.payment_request,
+          j?.paymentRequest,
+          j?.invoice,
+          j?.ln_invoice,
+          j?.lnurl,
+          j?.lnurl_pay,
+          j?.payment?.request,
+          j?.data?.invoice,
+          j?.payment_request
+        ].filter(Boolean);
+        const lnStr = lnCandidates[0] || '';
+        // Log raw response and LN invoice to console for debugging
+        console.log('PPQ topup response:', j);
+        console.log('Detected LN invoice / BOLT11:', lnStr);
+        console.log('Detected LN URL fields:', { lnurl: j?.lnurl || j?.ln_url || null });
+
+        if (lnStr) {
+          // Create clickable lightning: URI link if wallet supports it
+          const a = document.createElement('a');
+          a.href = 'lightning:' + lnStr;
+          a.textContent = 'Pay with Lightning (URI)';
+          a.style.display = 'block';
+          a.style.marginTop = '8px';
+          $('invoiceArea').appendChild(a);
+
+          // Copy button for manual paste
+          const copyBtn = document.createElement('button');
+          copyBtn.textContent = 'Copy BOLT11';
+          copyBtn.style.marginLeft = '8px';
+          copyBtn.addEventListener('click', async () => {
+            try {
+              await navigator.clipboard.writeText(lnStr);
+              copyBtn.textContent = 'Copied';
+              setTimeout(()=>copyBtn.textContent='Copy BOLT11',2000);
+            } catch(e) {
+              alert('Copy failed: '+e.message);
+            }
+          });
+          $('invoiceArea').appendChild(copyBtn);
+        }
       }
       if (j?.id) {
         const span = document.createElement('div'); span.textContent = 'Invoice id: '+j.id; $('invoiceArea').appendChild(span);
