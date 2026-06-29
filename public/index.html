@@ -56,6 +56,8 @@
     </section>
 
     <section class="card">
+      <div id="estimates" class="muted small">Estimated cost: —</div>
+      <div id="epubProgress" class="muted small"></div>
       <button id="hertaal" disabled>Hertaal (Re-translate)</button>
       <div id="log" class="log"></div>
     </section>
@@ -74,6 +76,8 @@
   let epubFiles = null; // JSZip instance for EPUB
   let invoiceId = null;
   let invoicePaid = false;
+  let lastTasks = [];
+  let modelRatesCache = null;
 
   // Drag & drop
   const drop = $('dropzone');
@@ -88,6 +92,8 @@
     selectedFile = file;
     $('fileInfo').textContent = `${file.name} — ${Math.round(file.size/1024)} KB`;
     log(`Selected file: ${file.name}`);
+    // If EPUB, pre-scan chapters and estimate cost
+    if (file.name.toLowerCase().endsWith('.epub')) scanEpubForEstimate(file).catch(e=>{console.error(e); log('EPUB scan error: '+e.message);});
   }
 
   // Balance check
@@ -155,15 +161,15 @@
       const j = await res.json();
       // PPQ returns invoice info — try to find id and invoice/bbolt11
       invoiceId = j?.id || j?.invoice_id || j?.invoice?.id || j?.paymentRequest || j?.bolt11 || j?.invoice;
-      const bolt11 = j?.payment_request || j?.invoice || j?.bolt11 || j?.paymentRequest || j?.payment_request;
+      const bolt11 = j?.payment_request || j?.invoice || j?.bolt11 || j?.paymentRequest || j?.payment_request || j?.ln_invoice || j?.payment_request;
       $('invoiceArea').innerHTML = '';
       if (bolt11) {
         const pre = document.createElement('pre'); pre.textContent = 'BOLT11: '+bolt11; $('invoiceArea').appendChild(pre);
-        const qrcode = document.createElement('div'); $('invoiceArea').appendChild(qrcode);
-        try { new QRCode(qrcode, { text: bolt11, width: 180, height: 180 }); } catch(e) {}
+        const qrcode = document.createElement('div'); qrcode.id = 'qrContainer'; qrcode.style.marginTop = '8px'; $('invoiceArea').appendChild(qrcode);
+        try { await renderQr(qrcode, bolt11); } catch(e) { console.warn('QR render failed', e); }
       }
       if (j?.id) {
-        $('invoiceArea').appendChild(document.createTextNode('Invoice id: '+j.id));
+        const span = document.createElement('div'); span.textContent = 'Invoice id: '+j.id; $('invoiceArea').appendChild(span);
         invoiceId = j.id;
       }
       $('invoiceArea').appendChild(document.createElement('br'));
@@ -207,6 +213,7 @@
       const name = selectedFile.name;
       if (name.endsWith('.txt') || name.endsWith('.md') || name.endsWith('.html') || name.endsWith('.htm')) {
         const text = await selectedFile.text();
+        showEstimates({totalTokens: estimateTokensFromText(text)});
         const translated = await translateChunkHtmlOrText(text, levelName, key);
         downloadBlob(new Blob([translated], {type:'text/plain'}), name.replace(/\.(txt|md|html|htm)$/i, `_hertaal.${name.split('.').pop()}`));
         log('Done: downloaded translated file');
@@ -228,34 +235,47 @@
         const manifestItems = {}; for (const item of opfDoc.getElementsByTagName('item')) manifestItems[item.getAttribute('id')] = item.getAttribute('href');
         const spine = [...opfDoc.getElementsByTagName('itemref')].map(ir => ir.getAttribute('idref'));
         log('Found '+spine.length+' spine items');
+        // try to find nav/toc titles
+        const navMap = await extractNavMap(zip, opfDoc, opfPath);
         // Prepare tasks for each spine item
-        const tasks = spine.map(idref => ({ idref, href: manifestItems[idref] }));
+        const tasks = spine.map((idref, idx) => ({ idref, href: manifestItems[idref], title: navMap[manifestItems[idref]] || `Chapter ${idx+1}` }));
+        lastTasks = tasks;
+        renderProgressList(tasks);
+        // estimate tokens and cost
+        const estimates = await estimateCostsForTasks(tasks, zip, opfPath, $('apiKey').value.trim());
+        showEstimates(estimates);
         // translate each in parallel limited
         const pool = makePool(concurrency);
-        for (const t of tasks) pool.add(async () => {
+        tasks.forEach((t, i) => pool.add(async () => {
+          const progressEl = document.getElementById('task-'+i);
+          if (progressEl) progressEl.querySelector('.status').textContent = 'in-progress';
           const itemPath = resolvePath(opfPath, t.href);
           const file = zip.file(itemPath);
-          if (!file) { log('Missing spine file '+itemPath); return; }
+          if (!file) { log('Missing spine file '+itemPath); if (progressEl) progressEl.querySelector('.status').textContent = 'missing'; return; }
           const html = await file.async('text');
           // extract body innerHTML
           const doc = parser.parseFromString(html, 'text/html');
           const body = doc.body.innerHTML;
-          const translated = await translateChunkHtmlOrText(body, levelName, key);
-          // put translated back into doc
-          const outDoc = parser.parseFromString(html, 'text/html');
-          outDoc.body.innerHTML = translated;
-          const serializer = new XMLSerializer();
-          const outText = '<!DOCTYPE html>\n' + serializer.serializeToString(outDoc);
-          zip.file(itemPath, outText);
-          log('Translated '+t.href);
-        });
+          try {
+            const translated = await translateChunkHtmlOrText(body, levelName, $('apiKey').value.trim());
+            // put translated back into doc
+            const outDoc = parser.parseFromString(html, 'text/html');
+            outDoc.body.innerHTML = translated;
+            const serializer = new XMLSerializer();
+            const outText = '<!DOCTYPE html>\n' + serializer.serializeToString(outDoc);
+            zip.file(itemPath, outText);
+            log('Translated '+t.href);
+            if (progressEl) progressEl.querySelector('.status').textContent = 'done';
+          } catch (e) {
+            console.error(e); log('Translate failed for '+t.href+': '+e.message); if (progressEl) progressEl.querySelector('.status').textContent = 'error';
+          }
+        }));
         await pool.runAll();
         log('All chapters translated. Repacking EPUB...');
-        // ensure mimetype file stored uncompressed at root
-        // JSZip options: { compression: 'STORE' } ??? JSZip uses options.compress
-        // We'll generate blob and download as .epub
+        // ensure mimetype file stored uncompressed at root (best-effort)
+        try { if (zip.file('mimetype')) zip.file('mimetype', await zip.file('mimetype').async('string'), {compression:'STORE'}); } catch(e){/*ignore*/}
         const content = await zip.generateAsync({type:'blob'});
-        downloadBlob(content, name.replace(/\.epub$/i, '_hertaal.epub'));
+        downloadBlob(content, selectedFile.name.replace(/\.epub$/i, '_hertaal.epub'));
         log('EPUB download ready');
       } else {
         alert('Unsupported file type. Use TXT/MD/HTML/EPUB');
@@ -273,6 +293,29 @@
     return (base? base+'/' : '') + href;
   }
 
+  // Extract nav map: href -> title
+  async function extractNavMap(zip, opfDoc, opfPath) {
+    try {
+      // find manifest item with properties~nav
+      const items = [...opfDoc.getElementsByTagName('item')];
+      let navItem = items.find(it => (it.getAttribute('properties') || '').includes('nav')) || items.find(it => (it.getAttribute('id')||'').toLowerCase().includes('nav')) || items.find(it => (it.getAttribute('href')||'').toLowerCase().includes('nav'));
+      if (!navItem) return {};
+      const navHref = navItem.getAttribute('href');
+      const navPath = resolvePath(opfPath, navHref);
+      const navText = await zip.file(navPath).async('text');
+      const parser = new DOMParser();
+      const navDoc = parser.parseFromString(navText, 'text/html');
+      const map = {};
+      // find links in nav
+      const anchors = navDoc.querySelectorAll('a[href]');
+      anchors.forEach(a => {
+        const href = a.getAttribute('href').split('#')[0];
+        map[href] = (a.textContent || '').trim();
+      });
+      return map;
+    } catch (e) { console.warn('extractNavMap failed', e); return {}; }
+  }
+
   // Simple concurrency pool
   function makePool(limit) {
     const queue = []; let active = 0;
@@ -288,6 +331,69 @@
       })
     };
   }
+
+  // Estimate tokens from plain text
+  function estimateTokensFromText(text) {
+    const words = (text||'').trim().split(/\s+/).filter(Boolean).length;
+    // heuristic: 1 token ~= 0.75 words -> tokens = words / 0.75
+    const tokens = Math.max(1, Math.ceil(words / 0.75));
+    return tokens;
+  }
+
+  async function estimateCostsForTasks(tasks, zip, opfPath, key) {
+    // compute token estimate per task
+    let totalTokens = 0; const per = [];
+    const parser = new DOMParser();
+    for (const t of tasks) {
+      try {
+        const itemPath = resolvePath(opfPath, t.href);
+        const file = zip.file(itemPath);
+        if (!file) { per.push({ title:t.title, tokens:0 }); continue; }
+        const html = await file.async('text');
+        const doc = parser.parseFromString(html, 'text/html');
+        const text = doc.body ? doc.body.textContent || '' : html;
+        const tokens = estimateTokensFromText(text);
+        per.push({ title: t.title, tokens }); totalTokens += tokens;
+      } catch (e) { per.push({ title: t.title, tokens:0 }); }
+    }
+    // try to fetch model rates
+    let usdPerThousand = null;
+    try {
+      const res = await fetch('https://api.ppq.ai/v1/models');
+      if (res.ok) { const j = await res.json(); const models = j?.data || j;
+        // try to find gpt-5.5 or first model with input_rate + output_rate
+        let m = models.find(m=> (m?.id||m?.model||'').includes('gpt-5.5')) || models.find(m=> m?.input_rate || m?.output_rate) || models[0];
+        if (m) {
+          const inRate = parseFloat(m.input_rate || m.inputRate || 0) || 0;
+          const outRate = parseFloat(m.output_rate || m.outputRate || 0) || 0;
+          if (inRate || outRate) usdPerThousand = inRate + outRate;
+        }
+      }
+    } catch(e){ /*ignore*/ }
+    // fallback to 0.02 USD per 1k tokens
+    if (!usdPerThousand) usdPerThousand = 0.02;
+    const estimatedUSD = (totalTokens/1000) * usdPerThousand;
+    return { totalTokens, usdPerThousand, estimatedUSD, per };
+  }
+
+  function showEstimates(est) {
+    if (!est) { $('estimates').textContent = 'Estimated cost: —'; return; }
+    const usd = est.estimatedUSD ? `$${est.estimatedUSD.toFixed(4)}` : 'unknown';
+    $('estimates').textContent = `Estimated tokens: ${est.totalTokens} • Estimated cost (USD): ${usd}`;
+  }
+
+  function renderProgressList(tasks) {
+    const container = $('epubProgress'); container.innerHTML = '';
+    const ul = document.createElement('div'); ul.className = 'progress-list';
+    tasks.forEach((t,i) => {
+      const item = document.createElement('div'); item.id = 'task-'+i; item.className = 'progress-item';
+      item.innerHTML = `<strong>${escapeHtml(t.title)}</strong> <span class="status">pending</span>`;
+      ul.appendChild(item);
+    });
+    container.appendChild(ul);
+  }
+
+  function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
   // Translate chunk using PPQ Chat API
   async function translateChunkHtmlOrText(inputHtmlOrText, levelName, key) {
@@ -312,12 +418,43 @@
     const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url), 60000);
   }
 
+  // QR rendering helper that loads lib if needed
+  function loadScript(src){ return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+  async function renderQr(el, text) {
+    if (!window.QRCode) {
+      await loadScript('https://cdn.jsdelivr.net/npm/qrcodejs2@0.0.2/qrcode.min.js');
+      if (!window.QRCode) throw new Error('QR library failed to load');
+    }
+    // clear
+    el.innerHTML = '';
+    try { new QRCode(el, { text, width: 220, height: 220 }); } catch(e) { throw e; }
+  }
+
+  // Scan EPUB to compute estimates (called on file selection)
+  async function scanEpubForEstimate(file) {
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const zip = await JSZip.loadAsync(arrayBuffer);
+      const containerXml = await zip.file('META-INF/container.xml').async('text');
+      const parser = new DOMParser();
+      const contDoc = parser.parseFromString(containerXml, 'application/xml');
+      const rootfile = contDoc.querySelector('rootfile');
+      const opfPath = rootfile ? rootfile.getAttribute('full-path') : 'content.opf';
+      const opfText = await zip.file(opfPath).async('text');
+      const opfDoc = parser.parseFromString(opfText, 'application/xml');
+      const manifestItems = {}; for (const item of opfDoc.getElementsByTagName('item')) manifestItems[item.getAttribute('id')] = item.getAttribute('href');
+      const spine = [...opfDoc.getElementsByTagName('itemref')].map(ir => ir.getAttribute('idref'));
+      const navMap = await extractNavMap(zip, opfDoc, opfPath);
+      const tasks = spine.map((idref, idx) => ({ idref, href: manifestItems[idref], title: navMap[manifestItems[idref]] || `Chapter ${idx+1}` }));
+      const estimates = await estimateCostsForTasks(tasks, zip, opfPath, $('apiKey').value.trim());
+      showEstimates(estimates);
+      renderProgressList(tasks);
+    } catch (e) { console.warn('scanEpubForEstimate failed', e); }
+  }
+
   // simple QR lib (only if available) fallback
-  // load QRCode if not present
-  (function loadQRCode(){
-    if (window.QRCode) return;
-    const s = document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/qrcodejs2@0.0.2/qrcode.min.js'; s.onload = ()=>log('QR lib loaded'); document.head.appendChild(s);
-  })();
+  // load QRCode if not present (do not block)
+  (function loadQRCode(){ if (!window.QRCode) { const s = document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/qrcodejs2@0.0.2/qrcode.min.js'; s.onload = ()=>log('QR lib loaded'); document.head.appendChild(s); } })();
 
   // enable Hertaal when file selected and choices made
   setInterval(updateHertaalState, 500);
