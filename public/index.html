@@ -176,91 +176,47 @@
       });
       if (!res.ok) { const t = await res.text(); $('invoiceArea').textContent = 'Invoice creation failed: '+res.status+' '+t; return; }
       const j = await res.json();
-      // PPQ returns invoice info — try to find id and invoice/bbolt11
-      invoiceId = j?.id || j?.invoice_id || j?.invoice?.id || j?.paymentRequest || j?.bolt11 || j?.invoice;
-      const bolt11 = j?.payment_request || j?.invoice || j?.bolt11 || j?.paymentRequest || j?.payment_request || j?.ln_invoice || j?.payment_request;
+      // Show raw response immediately so user can inspect or copy regardless of field names
       $('invoiceArea').innerHTML = '';
-      if (bolt11) {
-        const pre = document.createElement('pre'); pre.textContent = 'BOLT11: '+bolt11; $('invoiceArea').appendChild(pre);
+      try {
+        const rawPre = document.createElement('pre'); rawPre.style.maxHeight='240px'; rawPre.style.overflow='auto'; rawPre.textContent = JSON.stringify(j, null, 2);
+        $('invoiceArea').appendChild(rawPre);
+      } catch(e) { console.warn('Could not render raw JSON', e); }
+
+      // PPQ returns invoice info — try to find id and invoice/bbolt11
+      invoiceId = j?.id || j?.invoice_id || j?.invoice?.id || j?.paymentRequest || j?.bolt11 || j?.invoice || j?.data?.id;
+      const bolt11 = j?.payment_request || j?.invoice || j?.bolt11 || j?.paymentRequest || j?.payment_request || j?.ln_invoice || j?.data?.payment_request || j?.data?.invoice;
+
+      // Log raw response and LN invoice to console for debugging
+      console.log('PPQ topup response:', j);
+      const lnCandidates = [bolt11, j?.payment_request, j?.paymentRequest, j?.invoice, j?.ln_invoice, j?.lnurl, j?.lnurl_pay, j?.payment?.request, j?.data?.invoice, j?.data?.payment_request].filter(Boolean);
+      const lnStr = lnCandidates[0] || '';
+      console.log('Detected LN invoice / BOLT11:', lnStr);
+      console.log('Detected LN URL fields:', { lnurl: j?.lnurl || j?.ln_url || null });
+
+      // If we found a bolt11 string, render QR and payment helpers
+      if (lnStr) {
+        const pre2 = document.createElement('pre'); pre2.textContent = 'BOLT11: '+lnStr; $('invoiceArea').appendChild(pre2);
         const qrcode = document.createElement('div'); qrcode.id = 'qrContainer'; qrcode.style.marginTop = '8px'; $('invoiceArea').appendChild(qrcode);
-        try {
-          await renderQr(qrcode, bolt11);
-        } catch(e) {
-          console.warn('QR render failed', e);
-        }
-        // Collect possible LN invoice strings and explicit logging
-        const lnCandidates = [
-          bolt11,
-          j?.payment_request,
-          j?.paymentRequest,
-          j?.invoice,
-          j?.ln_invoice,
-          j?.lnurl,
-          j?.lnurl_pay,
-          j?.payment?.request,
-          j?.data?.invoice,
-          j?.payment_request,
-          j?.data?.payment_request
-        ].filter(Boolean);
-        const lnStr = lnCandidates[0] || '';
-        // Log raw response and LN invoice to console for debugging
-        console.log('PPQ topup response:', j);
-        console.log('Detected LN invoice / BOLT11:', lnStr);
-        console.log('Detected LN URL fields:', { lnurl: j?.lnurl || j?.ln_url || null });
+        try { await renderQr(qrcode, lnStr); } catch(e){ console.warn('QR render failed', e); }
 
-        // Also show raw JSON in the UI for easier copy/paste
-        try {
-          const rawPre = document.createElement('pre'); rawPre.style.maxHeight='200px'; rawPre.style.overflow='auto'; rawPre.textContent = JSON.stringify(j, null, 2);
-          $('invoiceArea').appendChild(rawPre);
-        } catch(e) { /* ignore */ }
-
-        if (lnStr) {
-          // Create clickable lightning: URI link if wallet supports it
-          const a = document.createElement('a');
-          a.href = 'lightning:' + lnStr;
-          a.textContent = 'Pay with Lightning (URI)';
-          a.style.display = 'block';
-          a.style.marginTop = '8px';
-          $('invoiceArea').appendChild(a);
-
-          // Also show lnurl-style string explicitly
-          const lnurlPre = document.createElement('div'); lnurlPre.textContent = 'LN invoice (raw): ' + lnStr; lnurlPre.style.marginTop='6px'; $('invoiceArea').appendChild(lnurlPre);
-
-          // Add web-wallet pay link (opened in new tab) using https://paywithln.com/ or web wallet URLs
-          const webWalletLink = document.createElement('a');
-          webWalletLink.href = `https://paywithln.com/?bolt11=${encodeURIComponent(lnStr)}`;
-          webWalletLink.textContent = 'Open web wallet (PayWithLN)';
-          webWalletLink.target = '_blank'; webWalletLink.style.display='inline-block'; webWalletLink.style.marginTop='6px';
-          $('invoiceArea').appendChild(webWalletLink);
-
-          // Copy button for manual paste
-          const copyBtn = document.createElement('button');
-          copyBtn.textContent = 'Copy BOLT11';
-          copyBtn.style.marginLeft = '8px';
-          copyBtn.addEventListener('click', async () => {
-            try {
-              await navigator.clipboard.writeText(lnStr);
-              copyBtn.textContent = 'Copied';
-              setTimeout(()=>copyBtn.textContent='Copy BOLT11',2000);
-            } catch(e) {
-              alert('Copy failed: '+e.message);
-            }
-          });
-          $('invoiceArea').appendChild(copyBtn);
-        } else {
-          // No ln string detected
-          const note = document.createElement('div'); note.textContent = 'No LN invoice string detected in response.'; note.style.marginTop='8px'; $('invoiceArea').appendChild(note);
-        }
+        const a = document.createElement('a'); a.href = 'lightning:' + lnStr; a.textContent = 'Pay with Lightning (URI)'; a.style.display = 'block'; a.style.marginTop = '8px'; $('invoiceArea').appendChild(a);
+        const lnurlPre = document.createElement('div'); lnurlPre.textContent = 'LN invoice (raw): ' + lnStr; lnurlPre.style.marginTop='6px'; $('invoiceArea').appendChild(lnurlPre);
+        const webWalletLink = document.createElement('a'); webWalletLink.href = `https://paywithln.com/?bolt11=${encodeURIComponent(lnStr)}`; webWalletLink.textContent = 'Open web wallet (PayWithLN)'; webWalletLink.target = '_blank'; webWalletLink.style.display='inline-block'; webWalletLink.style.marginTop='6px'; $('invoiceArea').appendChild(webWalletLink);
+        const copyBtn = document.createElement('button'); copyBtn.textContent = 'Copy BOLT11'; copyBtn.style.marginLeft = '8px'; copyBtn.addEventListener('click', async () => { try{ await navigator.clipboard.writeText(lnStr); copyBtn.textContent = 'Copied'; setTimeout(()=>copyBtn.textContent='Copy BOLT11',2000); } catch(e){ alert('Copy failed: '+e.message); } }); $('invoiceArea').appendChild(copyBtn);
+      } else {
+        const note = document.createElement('div'); note.textContent = 'No LN invoice string detected in response. Raw response shown above.'; note.style.marginTop='8px'; $('invoiceArea').appendChild(note);
       }
-      if (j?.id) {
-        const span = document.createElement('div'); span.textContent = 'Invoice id: '+j.id; $('invoiceArea').appendChild(span);
-        invoiceId = j.id;
+
+      if (invoiceId) {
+        const span = document.createElement('div'); span.textContent = 'Invoice id: '+invoiceId; $('invoiceArea').appendChild(span);
       }
       $('invoiceArea').appendChild(document.createElement('br'));
       const payBtn = document.createElement('button'); payBtn.textContent = 'I paid (poll status)';
       payBtn.addEventListener('click', () => pollInvoiceStatus(key, invoiceId));
       $('invoiceArea').appendChild(payBtn);
       log('Invoice created');
+
     } catch (err) {
       console.error(err);
       $('invoiceArea').textContent = 'Error creating invoice: '+err.message;
