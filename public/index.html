@@ -182,13 +182,20 @@
           j?.lnurl_pay,
           j?.payment?.request,
           j?.data?.invoice,
-          j?.payment_request
+          j?.payment_request,
+          j?.data?.payment_request
         ].filter(Boolean);
         const lnStr = lnCandidates[0] || '';
         // Log raw response and LN invoice to console for debugging
         console.log('PPQ topup response:', j);
         console.log('Detected LN invoice / BOLT11:', lnStr);
         console.log('Detected LN URL fields:', { lnurl: j?.lnurl || j?.ln_url || null });
+
+        // Also show raw JSON in the UI for easier copy/paste
+        try {
+          const rawPre = document.createElement('pre'); rawPre.style.maxHeight='200px'; rawPre.style.overflow='auto'; rawPre.textContent = JSON.stringify(j, null, 2);
+          $('invoiceArea').appendChild(rawPre);
+        } catch(e) { /* ignore */ }
 
         if (lnStr) {
           // Create clickable lightning: URI link if wallet supports it
@@ -198,6 +205,9 @@
           a.style.display = 'block';
           a.style.marginTop = '8px';
           $('invoiceArea').appendChild(a);
+
+          // Also show lnurl-style string explicitly
+          const lnurlPre = document.createElement('div'); lnurlPre.textContent = 'LN invoice (raw): ' + lnStr; lnurlPre.style.marginTop='6px'; $('invoiceArea').appendChild(lnurlPre);
 
           // Copy button for manual paste
           const copyBtn = document.createElement('button');
@@ -213,6 +223,9 @@
             }
           });
           $('invoiceArea').appendChild(copyBtn);
+        } else {
+          // No ln string detected
+          const note = document.createElement('div'); note.textContent = 'No LN invoice string detected in response.'; note.style.marginTop='8px'; $('invoiceArea').appendChild(note);
         }
       }
       if (j?.id) {
